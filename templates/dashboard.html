@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% block body %}
+{% set pct = (done*100//total) if total else 0 %}
+<div class="grid"><div class="card"><div class="mut">Days to GATE</div><div class="big">{{ days_left }}</div></div>
+<div class="card"><div class="mut">Syllabus completed</div><div class="big">{{pct}}%</div><div class="bar"><i style="width:{{pct}}%"></i></div><div class="mut">{{done}}/{{total}} topics</div></div>
+<div class="card"><div class="mut">Quick links</div><a href="{{url_for('plan')}}">My study plan</a><br><a href="{{url_for('tests')}}">Take a mock test</a></div></div>
+<h3>Subject progress</h3><div class="grid">{% for s in subs %}{% set p=(s.done*100//s.total) if s.total else 0 %}
+<a class="card" href="{{url_for('subject',sid=s.id)}}" style="color:inherit"><b>{{s.icon}} {{s.name}}</b><div class="mut">~{{s.weightage}}% marks</div><div class="bar"><i style="width:{{p}}%"></i></div><div class="mut">{{s.done}}/{{s.total}}</div></a>{% endfor %}</div>
+<div class="grid"><div class="card"><h3>Recent tests</h3>{% for a in attempts %}<div class="row"><span>{{a.sname or 'Full mock'}}</span><span class="right">{{a.score}}/{{a.total}}</span></div>{% else %}<p class="mut">No attempts yet.</p>{% endfor %}</div>
+<div class="card"><h3>Bookmarks</h3>{% for b in bookmarks %}<div><a href="{{b.url}}" target="_blank" rel="noopener">{{b.title}}</a></div>{% else %}<p class="mut">Bookmark resources from subject pages.</p>{% endfor %}</div>
+<div class="card"><h3>Updates</h3>{% for u in updates %}<div><b>{{u.title}}</b></div>{% endfor %}<a href="{{url_for('updates')}}">All updates →</a></div></div>
+{% endblock %}

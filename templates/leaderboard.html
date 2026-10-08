@@ -1,0 +1,2 @@
+{% extends "base.html" %}{% block body %}<h2>Leaderboard</h2><table><tr><th>#</th><th>Name</th><th>Total points</th><th>Tests</th></tr>
+{% for r in rows %}<tr><td>{{loop.index}}</td><td>{{r.name}}</td><td>{{r.pts}}</td><td>{{r.tests}}</td></tr>{% endfor %}</table>{% endblock %}

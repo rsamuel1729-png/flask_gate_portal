@@ -1,0 +1,4 @@
+{% extends "base.html" %}{% block body %}<h2>Search: {{term}}</h2>
+{% for t in topics %}<div class="card"><a href="{{url_for('subject',sid=t.subject_id)}}#t{{t.id}}">{{t.name}}</a> <span class="mut">{{t.sname}}</span></div>{% endfor %}
+{% for r in res %}<div class="card"><a href="{{r.url}}" target="_blank" rel="noopener">{{r.title}}</a></div>{% endfor %}
+{% if not topics and not res %}<p class="mut">No results.</p>{% endif %}{% endblock %}

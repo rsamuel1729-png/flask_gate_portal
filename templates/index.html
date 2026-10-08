@@ -1,0 +1,6 @@
+{% extends "base.html" %}{% block body %}
+<div class="card" style="text-align:center;padding:40px"><h1>Crack GATE CSE with a plan, not luck</h1>
+<p class="mut">Subject-wise materials, video lectures, an adaptive study plan, mock tests with negative marking, and live exam updates.</p>
+<a class="btn" href="{{url_for('register')}}">Start preparing free</a></div>
+<h3>Latest exam updates</h3>{% for u in updates %}<div class="card"><b>{{u.title}}</b><p>{{u.body}}</p>{% if u.link %}<a href="{{u.link}}" target="_blank" rel="noopener">Read more →</a>{% endif %}</div>{% endfor %}
+{% endblock %}

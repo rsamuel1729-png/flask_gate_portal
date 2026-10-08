@@ -1,0 +1,2 @@
+{% extends "base.html" %}{% block body %}<h2>Subjects</h2><div class="grid">{% for s in subs %}{% set p=(s.done*100//s.total) if s.total else 0 %}
+<a class="card" href="{{url_for('subject',sid=s.id)}}" style="color:inherit"><h3>{{s.icon}} {{s.name}}</h3><span class="tag">~{{s.weightage}}% weightage</span><p class="mut">{{s.total}} topics</p><div class="bar"><i style="width:{{p}}%"></i></div></a>{% endfor %}</div>{% endblock %}

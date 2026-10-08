@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block body %}
+<div class="row"><h2>{{s.icon}} {{s.name}}</h2><a class="btn sec right" href="{{url_for('take_test',sid=s.id)}}">Practice test</a></div>
+{% for t in topics %}<div class="card" id="t{{t.id}}"><div class="row"><b>{{t.name}}</b>
+<form class="inline right" method="post" action="{{url_for('toggle',tid=t.id)}}"><button class="btn sm {{'' if t.done else 'sec'}}">{{ '✓ Completed' if t.done else 'Mark complete' }}</button></form></div>
+{% for r in res[t.id] %}<div class="row"><span class="tag">{{r.kind}}</span><a href="{{r.url}}" target="_blank" rel="noopener">{{r.title}}</a>
+<form class="inline right" method="post" action="{{url_for('bookmark',rid=r.id)}}"><button class="btn sm sec">{{ '★' if r.bm else '☆' }}</button></form></div>{% endfor %}
+<details><summary class="mut">My notes</summary><form method="post" action="{{url_for('note',tid=t.id)}}"><textarea name="body" rows="3">{{t.note or ''}}</textarea><button class="btn sm">Save</button></form></details></div>{% endfor %}
+{% endblock %}

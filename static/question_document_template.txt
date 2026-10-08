@@ -1,0 +1,28 @@
+QUESTION DOCUMENT FORMAT EXAMPLE
+Use this structure in a Word document (.docx) or a text-based PDF. Repeat the same pattern for every question.
+Select the subject in the Admin upload form. Topic is optional, but if used it must exactly match a topic name for that subject.
+
+Q1. Which data structure follows last-in, first-out order?
+A) Queue
+B) Stack
+C) Graph
+D) Heap
+Answer: B
+Explanation: A stack removes the most recently added item first.
+Topic: Arrays, Stacks, Queues, Linked Lists
+
+Q2. What order does an inorder traversal of a binary search tree produce?
+A) Sorted order
+B) Level order
+C) Insertion order
+D) Random order
+Answer: A
+Explanation: Inorder traversal visits left subtree, root, then right subtree.
+Topic: Trees, BST, Heaps
+
+NOTES
+- Start every question with Q<number>. or <number>.)
+- Put each option on its own line, labeled A), B), C), and D).
+- Include an explicit Answer: A/B/C/D inside each question block.
+- Explanation: and Topic: are optional.
+- Keep question text and option labels as selectable text. Scanned image PDFs need OCR before upload.

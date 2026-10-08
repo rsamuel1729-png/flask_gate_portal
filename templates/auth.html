@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block body %}
+<div class="card" style="max-width:440px;margin:auto"><h2>{{ 'Create account' if mode=='register' else ('Admin login' if mode=='admin' else 'Login') }}</h2>
+{% if mode=='admin' %}<p class="mut">Use the admin account configured for this installation. Admin access is separate from student registration.</p>{% endif %}
+<form method="post">{% if mode=='register' %}<label>Name</label><input name="name" required>{% endif %}
+<label>Email</label><input type="email" name="email" required><label>Password</label><input type="password" name="password" required minlength="6">
+<button class="btn">{{ 'Sign up' if mode=='register' else ('Admin login' if mode=='admin' else 'Login') }}</button></form>
+<p class="mut">{% if mode=='login' %}New here? <a href="{{url_for('register')}}">Sign up</a> · <a href="{{url_for('admin_login')}}">Admin login</a>{% elif mode=='admin' %}Student? <a href="{{url_for('login')}}">Student login</a>{% else %}Have an account? <a href="{{url_for('login')}}">Login</a>{% endif %}</p></div>
+{% endblock %}

@@ -1,0 +1,4 @@
+{% extends "base.html" %}{% block body %}<h2>GATE exam updates</h2>
+<div class="card">Configured exam start: <b>{{exam}}</b> · {{days_left}} days left. Always verify on the <a href="https://gate2027.iitk.ac.in" target="_blank" rel="noopener">official GATE website</a>.</div>
+{% if feed %}<h3>Live feed</h3>{% for i in feed %}<div class="card"><a href="{{i.link}}" target="_blank" rel="noopener">{{i.title}}</a> <span class="mut">{{i.date}}</span></div>{% endfor %}{% endif %}
+<h3>Announcements</h3>{% for u in items %}<div class="card"><b>{{u.title}}</b> <span class="mut">{{u.created[:10]}}</span><p>{{u.body}}</p>{% if u.link %}<a href="{{u.link}}" target="_blank" rel="noopener">Read more →</a>{% endif %}</div>{% endfor %}{% endblock %}

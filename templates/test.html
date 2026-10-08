@@ -1,0 +1,10 @@
+{% extends "base.html" %}{% block body %}
+<div class="row"><div><h2>{{title}}</h2><div class="mut">{{qs|length}} questions · 40 minutes · +1 correct, −⅓ wrong, 0 skipped</div></div><div class="right big" id="timer">40:00</div></div>
+<form method="post" id="tf" action="{{url_for('submit_test',sid=sid)}}"><input type="hidden" name="ids" value="{{qs|map(attribute='id')|join(',')}}">
+{% for x in qs %}<div class="card"><div class="mut">Q{{loop.index}}{% if x.topic_name %} · {{x.topic_name}}{% endif %}{% if x.year %} · GATE {{x.year}}{% endif %}{% if x.bank_name %} · {{x.bank_name}} · Set {{x.bank_set}}{% endif %}</div><b>{{x.text}}</b>
+{% for k in ['a','b','c','d'] %}<label style="display:block;margin:6px 0"><input type="radio" name="q{{x.id}}" value="{{k|upper}}" style="width:auto"> {{k|upper}}. {{x[k]}}</label>{% endfor %}
+<a href="#" class="mut" onclick="document.querySelectorAll('[name=q{{x.id}}]').forEach(r=>r.checked=false);return false">Clear</a></div>{% endfor %}
+<button class="btn" onclick="return confirm('Submit test?')">Submit</button></form>
+<script>let s={{minutes}}*60;const el=document.getElementById('timer'),f=document.getElementById('tf');
+const t=setInterval(()=>{s--;el.textContent=String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');if(s<=0){clearInterval(t);f.submit()}},1000);
+window.onbeforeunload=()=>'Test in progress';f.onsubmit=()=>{window.onbeforeunload=null}</script>{% endblock %}

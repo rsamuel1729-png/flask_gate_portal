@@ -1,0 +1,10 @@
+{% extends "base.html" %}{% block body %}<h2>Your study plan</h2>
+<div class="card"><form method="post" class="row"><div><label>Exam date</label><input type="date" name="exam_date" value="{{ed}}" required></div>
+<div><label>Study hours / day</label><input type="number" step="0.5" min="0.5" max="16" name="hours" value="{{hrs}}" required></div><button class="btn">Update plan</button></form>
+<p>{{days}} days left · {{remaining}} topics pending · {{revision_days}} days reserved for revision & mocks.</p>
+{% if days<=0 %}<p class="bad">Exam date has passed. Set a new date.</p>
+{% elif feasible %}<p class="ok">✔ On track: about {{need|int}}h of work fits within {{cap|int}}h available.</p>
+{% else %}<p class="bad">⚠ You need ~{{need|int}}h but have {{cap|int}}h. Study about {{suggest}}h/day or prioritise high-weightage subjects.</p>{% endif %}</div>
+{% for d,items in schedule %}<div class="card"><b>{{d.strftime('%a, %d %b')}}</b>{% for item in items %}{% set t=item.topic %}<div class="row"><span class="tag">{{t.sname}}</span> {{t.name}} <span class="mut right">{{item.hours}}h</span></div>{% endfor %}</div>
+{% else %}<p class="mut">All topics complete. Spend remaining time on mocks and revision.</p>{% endfor %}
+<p class="mut">Showing the next 21 study days. Topics are ordered by subject weightage and recalculated when you mark topics complete.</p>{% endblock %}
