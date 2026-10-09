@@ -1,42 +1,50 @@
-# GATE CSE Prep Portal (Flask)
+# GATE CSE Prep Portal (Flask + MongoDB)
 
-## Run locally
+## Start locally (PowerShell)
+
+MongoDB Server should be running as the Windows `MongoDB` service. The default connection is
+`mongodb://127.0.0.1:27017`, database `gate_portal`.
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-py app.py
+Get-Service MongoDB
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe app.py
 ```
 
-Open http://127.0.0.1:5000.
+Open http://127.0.0.1:5000. If the service is stopped, open PowerShell as Administrator and run
+`Start-Service MongoDB`.
 
-## Admin login
+## MongoDB setup and existing data
 
-Open http://127.0.0.1:5000/admin/login. Default local credentials are `admin@gate.local` / `admin123` on a fresh database.
-Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` to configure the initial admin credentials. Change the defaults before deploying.
+PyMongo is the Flask application's MongoDB driver. On startup, the app connects to MongoDB and creates indexes.
+On the first startup only, if `gate_portal` has no subject data and the old `gate.db` exists, the app copies its
+collections into MongoDB while preserving IDs. The SQLite file is left in place as a backup; MongoDB becomes the
+database used by the app. Existing users, password hashes, progress, notes, questions and attempts are migrated.
 
-Admins can post exam announcements, add syllabus topics, and add study resources. Questions can be entered individually,
-imported from CSV, or extracted from text-based PDF and DOCX documents.
+Configuration environment variables:
 
-## Importing question documents
+```powershell
+$env:MONGO_URI = "mongodb://127.0.0.1:27017"
+$env:MONGO_DATABASE = "gate_portal"
+$env:SECRET_KEY = "replace-with-a-long-random-secret"
+$env:ADMIN_EMAIL = "admin@gate.local"
+$env:ADMIN_PASSWORD = "change-this-password"
+```
 
-Open the Admin console and choose a subject, optionally a default topic, and a PDF or DOCX file up to 20 MB. The
-document must contain numbered MCQs, four labeled options, and an explicit correct answer for each question. The
-[question document example](static/question_document_template.txt) shows the format. The app extracts the questions,
-shows a preview and warnings, then waits for admin confirmation before importing. Image-only scanned PDFs need OCR
-before upload. Extraction can vary with document layout, so review the preview and answer keys before confirming.
+Set these before starting `app.py`. The MongoDB service is installed locally on the configured machine; the
+application does not install the server itself.
 
-Imported questions are shuffled and grouped into ordered sets of up to 30. Thus 90 questions create three sets; 40
-create one set of 30 and a second set of 10. Each student's mocks serve unseen questions first, in set order. If fewer
-than 30 unseen questions remain, the mock includes those carryover questions and fills the rest with questions that
-student has already answered. The portal tracks question usage separately for each student. Mocks remain capped at
-30 questions, with up to five tests per day and a 40-minute wait after each submitted test.
+## Admin and question imports
 
-PDF/DOCX extraction is not perfect, particularly for scanned pages and complex layouts. The app does not scrape
-online questions; only import content you have permission to use.
+Open http://127.0.0.1:5000/admin/login. On a fresh database, the default local login is
+`admin@gate.local` / `admin123`. Existing migrated admin accounts keep their original password hashes.
+
+Admins can post exam updates, add syllabus topics and resources, add single MCQs, import CSV question banks, or
+upload text-based PDF and DOCX question documents. Document uploads are previewed and editable before confirmation.
+Question banks are stored in MongoDB and divided into sets of up to 30; learner mocks serve unseen questions first.
+Scanned image PDFs require OCR before upload.
 
 ## Other settings
 
-Environment variables: `SECRET_KEY`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `GATE_EXAM_DATE` (YYYY-MM-DD), and
-`GATE_FEED_URL` (optional RSS/Atom feed). Verify exam dates against the official GATE website.
+`GATE_EXAM_DATE` uses `YYYY-MM-DD`. `GATE_FEED_URL` can point to an optional RSS/Atom feed. Verify exam dates on
+the official GATE site.

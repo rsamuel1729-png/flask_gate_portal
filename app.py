@@ -1,54 +1,56 @@
 import os, sqlite3, time, random, urllib.request, xml.etree.ElementTree as ET, csv, io, re, json, uuid
 from datetime import date, datetime, timedelta
 from functools import wraps
-from flask import Flask, g, render_template, request, redirect, url_for, session, flash, abort
+from flask import Flask, g, render_template, request, redirect, url_for, session, flash, abort, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import PyMongoError
 
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.environ.get("SECRET_KEY", "change-me-in-production"),
-    DATABASE=os.path.join(app.root_path, "gate.db"),
+    MONGO_URI=os.environ.get("MONGO_URI", "mongodb://127.0.0.1:27017"),
+    MONGO_DATABASE=os.environ.get("MONGO_DATABASE", "gate_portal"),
+    LEGACY_DATABASE=os.path.join(app.root_path, "gate.db"),
     GATE_EXAM_DATE=os.environ.get("GATE_EXAM_DATE", "2027-02-06"),  # verify on the official GATE site
     GATE_FEED_URL=os.environ.get("GATE_FEED_URL", ""),               # optional RSS/Atom feed for live news
     ADMIN_EMAIL=os.environ.get("ADMIN_EMAIL", "admin@gate.local"),
     ADMIN_PASSWORD=os.environ.get("ADMIN_PASSWORD", "admin123"),
 )
 
-# ---------- DB ----------
-def db():
-    if "db" not in g:
-        g.db = sqlite3.connect(app.config["DATABASE"])
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys=ON")
-    return g.db
+# ---------- MongoDB ----------
+mongo_client = MongoClient(app.config["MONGO_URI"], serverSelectionTimeoutMS=5000)
+mongo = mongo_client[app.config["MONGO_DATABASE"]]
 
-@app.teardown_appcontext
-def close_db(_):
-    d = g.pop("db", None)
-    if d: d.close()
+def collection(name): return mongo[name]
 
-def q(sql, args=(), one=False):
-    cur = db().execute(sql, args); rows = cur.fetchall()
-    return (rows[0] if rows else None) if one else rows
+def public_doc(doc):
+    if not doc: return None
+    doc = dict(doc)
+    doc.setdefault("id", doc.get("_id"))
+    doc.pop("_id", None)
+    return doc
 
-def run(sql, args=()):
-    cur = db().execute(sql, args); db().commit(); return cur.lastrowid
+def find_many(name, filter=None, sort=None, limit=None):
+    cur = collection(name).find(filter or {})
+    if sort: cur = cur.sort(sort)
+    if limit: cur = cur.limit(limit)
+    return [public_doc(doc) for doc in cur]
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE, pw TEXT, is_admin INT DEFAULT 0, hours REAL DEFAULT 4, exam_date TEXT);
-CREATE TABLE IF NOT EXISTS subjects(id INTEGER PRIMARY KEY, name TEXT, weightage INT, icon TEXT);
-CREATE TABLE IF NOT EXISTS topics(id INTEGER PRIMARY KEY, subject_id INT REFERENCES subjects(id) ON DELETE CASCADE, name TEXT);
-CREATE TABLE IF NOT EXISTS resources(id INTEGER PRIMARY KEY, topic_id INT REFERENCES topics(id) ON DELETE CASCADE, title TEXT, url TEXT, kind TEXT);
-CREATE TABLE IF NOT EXISTS progress(user_id INT, topic_id INT, done_at TEXT, PRIMARY KEY(user_id, topic_id));
-CREATE TABLE IF NOT EXISTS bookmarks(user_id INT, resource_id INT, PRIMARY KEY(user_id, resource_id));
-CREATE TABLE IF NOT EXISTS notes(user_id INT, topic_id INT, body TEXT, PRIMARY KEY(user_id, topic_id));
-CREATE TABLE IF NOT EXISTS questions(id INTEGER PRIMARY KEY, subject_id INT REFERENCES subjects(id) ON DELETE CASCADE, topic_id INT REFERENCES topics(id) ON DELETE SET NULL, text TEXT, a TEXT, b TEXT, c TEXT, d TEXT, ans TEXT, expl TEXT, source TEXT DEFAULT 'Original practice', year INT, kind TEXT DEFAULT 'MCQ', important INT DEFAULT 0, bank_id TEXT, bank_set INT);
-CREATE TABLE IF NOT EXISTS question_banks(id TEXT PRIMARY KEY, subject_id INT REFERENCES subjects(id), name TEXT, created TEXT, total INT);
-CREATE TABLE IF NOT EXISTS import_drafts(id TEXT PRIMARY KEY, user_id INT, subject_id INT, topic_id INT, filename TEXT, payload TEXT, created TEXT);
-CREATE TABLE IF NOT EXISTS attempts(id INTEGER PRIMARY KEY, user_id INT, subject_id INT, score REAL, total INT, correct INT, wrong INT, taken TEXT);
-CREATE TABLE IF NOT EXISTS attempt_answers(id INTEGER PRIMARY KEY, attempt_id INT REFERENCES attempts(id) ON DELETE CASCADE, question_id INT REFERENCES questions(id), selected TEXT, is_correct INT);
-CREATE TABLE IF NOT EXISTS updates(id INTEGER PRIMARY KEY, title TEXT, body TEXT, link TEXT, created TEXT);
-"""
+def find_one(name, filter=None): return public_doc(collection(name).find_one(filter or {}))
+
+def add_doc(name, data):
+    data = dict(data)
+    if "id" not in data:
+        counter = mongo["_counters"].find_one_and_update({"_id": name}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+        data["id"] = counter["seq"]
+    data["_id"] = data["id"]
+    collection(name).insert_one(data)
+    return data["id"]
+
+def put_doc(name, filter, data): collection(name).update_one(filter, {"$set": data}, upsert=True)
+def remove_doc(name, filter): return collection(name).delete_one(filter).deleted_count
+def count_docs(name, filter=None): return collection(name).count_documents(filter or {})
 
 def yt(s): return "https://www.youtube.com/results?search_query=" + s.replace(" ", "+")
 
@@ -196,45 +198,65 @@ SEED_Q = {  # subject: [(question, a, b, c, d, ans, explanation)]
   ("Direct-mapped cache with 8 lines: block 12 maps to line:", "2", "4", "5", "0", "B", "12 mod 8 = 4.")],
 }
 
+# ---------- MongoDB startup and one-time SQLite migration ----------
 def init_db():
-    d = sqlite3.connect(app.config["DATABASE"]); d.executescript(SCHEMA)
-    # Migrate existing local databases without deleting the learner's history.
-    qcols = {r[1] for r in d.execute("PRAGMA table_info(questions)")}
-    for col, declaration in (("topic_id", "INT REFERENCES topics(id) ON DELETE SET NULL"), ("source", "TEXT DEFAULT 'Original practice'"), ("year", "INT"), ("kind", "TEXT DEFAULT 'MCQ'"), ("important", "INT DEFAULT 0"), ("bank_id", "TEXT"), ("bank_set", "INT")):
-        if col not in qcols: d.execute(f"ALTER TABLE questions ADD COLUMN {col} {declaration}")
-    if not d.execute("SELECT 1 FROM subjects").fetchone():
-        for s, (w, ic, topics) in SEED.items():
-            sid = d.execute("INSERT INTO subjects(name,weightage,icon) VALUES(?,?,?)", (s, w, ic)).lastrowid
-            for t, res in topics.items():
-                tid = d.execute("INSERT INTO topics(subject_id,name) VALUES(?,?)", (sid, t)).lastrowid
-                for title, url, kind in res:
-                    d.execute("INSERT INTO resources(topic_id,title,url,kind) VALUES(?,?,?,?)", (tid, title, url, kind))
-        for s, qs in SEED_Q.items():
-            sid = d.execute("SELECT id FROM subjects WHERE name=?", (s,)).fetchone()[0]
-            for r in qs:
-                d.execute("INSERT INTO questions(subject_id,text,a,b,c,d,ans,expl) VALUES(?,?,?,?,?,?,?,?)", (sid, *r))
-        d.execute("INSERT INTO updates(title,body,link,created) VALUES(?,?,?,?)",
-                  ("Welcome to GATE CSE Prep", "Admins can post exam notifications here. Always confirm dates on the official GATE website.", "https://gate2027.iitk.ac.in", datetime.now().isoformat()))
-    if not d.execute("SELECT 1 FROM users WHERE is_admin=1").fetchone():
-        d.execute("INSERT INTO users(name,email,pw,is_admin) VALUES(?,?,?,1)",
-                  ("Admin", app.config["ADMIN_EMAIL"], generate_password_hash(app.config["ADMIN_PASSWORD"])))
-    # Tag the bundled starter questions so topic analysis works on existing installs too.
-    tag_rules = {
-        "Operating Systems": [("scheduling", "CPU Scheduling"), ("deadlock", "Synchronization & Deadlocks"), ("frames", "Memory Management & Virtual Memory")],
-        "Databases": [("3nf", "Normalization & Functional Dependencies"), ("sql clause", "SQL"), ("b+ tree", "Indexing & B/B+ Trees")],
-        "Algorithms": [("merge sort", "Divide & Conquer, Sorting"), ("dijkstra", "Graph Algorithms (BFS, DFS, MST, SSSP)"), ("knapsack", "Greedy & Dynamic Programming")],
-        "Computer Networks": [("/26", "IP Addressing & Routing"), ("tcp", "Transport Layer: TCP/UDP"), ("routing", "IP Addressing & Routing")],
-        "Digital Logic": [("nand", "Boolean Algebra & K-maps"), ("decoder", "Combinational Circuits")],
-        "Theory of Computation": [("closed", "Context-Free Languages & PDA"), ("halting", "Turing Machines & Decidability")],
-        "Engineering Mathematics": [("complete graph", "Graph Theory & Combinatorics"), ("mutually exclusive", "Probability & Statistics")],
-        "Programming & Data Structures": [("bst", "Trees, BST, Heaps"), ("stack", "Arrays, Stacks, Queues, Linked Lists")],
-        "Computer Organization & Architecture": [("hazard", "Pipelining"), ("cache", "Cache & Memory Hierarchy")],
-    }
-    for subject_name, rules in tag_rules.items():
-        for needle, topic_name in rules:
-            d.execute("UPDATE questions SET topic_id=(SELECT t.id FROM topics t JOIN subjects s ON s.id=t.subject_id WHERE s.name=? AND t.name=?) WHERE topic_id IS NULL AND subject_id=(SELECT id FROM subjects WHERE name=?) AND lower(text) LIKE ?",
-                      (subject_name, topic_name, subject_name, f"%{needle}%"))
-    d.commit(); d.close()
+    mongo_client.admin.command("ping")
+    collection("users").create_index("email", unique=True)
+    collection("progress").create_index([("user_id", 1), ("topic_id", 1)], unique=True)
+    collection("bookmarks").create_index([("user_id", 1), ("resource_id", 1)], unique=True)
+    collection("notes").create_index([("user_id", 1), ("topic_id", 1)], unique=True)
+    collection("attempt_answers").create_index([("attempt_id", 1), ("question_id", 1)], unique=True)
+    if count_docs("subjects") == 0 and os.path.exists(app.config["LEGACY_DATABASE"]):
+        legacy = sqlite3.connect(app.config["LEGACY_DATABASE"])
+        legacy.row_factory = sqlite3.Row
+        tables = [r[0] for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+        for table in tables:
+            docs = []
+            for i, row in enumerate(legacy.execute(f'SELECT * FROM "{table}"')):
+                doc = dict(row)
+                if "id" in doc and doc["id"] is not None:
+                    doc["_id"] = doc["id"]
+                else:
+                    doc["_id"] = f"legacy:{table}:{i}"
+                docs.append(doc)
+            if docs:
+                collection(table).insert_many(docs, ordered=False)
+                numeric = [d.get("id") for d in docs if isinstance(d.get("id"), int)]
+                if numeric:
+                    mongo["_counters"].update_one({"_id": table}, {"$max": {"seq": max(numeric)}}, upsert=True)
+        legacy.close()
+    if count_docs("subjects") == 0:
+        topic_ids = {}
+        for name, (weight, icon, topic_map) in SEED.items():
+            sid = add_doc("subjects", {"name": name, "weightage": weight, "icon": icon})
+            topic_ids[name] = {}
+            for topic_name, resources in topic_map.items():
+                tid = add_doc("topics", {"subject_id": sid, "name": topic_name})
+                topic_ids[name][topic_name] = tid
+                for title, link, kind in resources:
+                    add_doc("resources", {"topic_id": tid, "title": title, "url": link, "kind": kind})
+        rules = {
+            "Operating Systems": [("scheduling", "CPU Scheduling"), ("deadlock", "Synchronization & Deadlocks"), ("frames", "Memory Management & Virtual Memory")],
+            "Databases": [("3nf", "Normalization & Functional Dependencies"), ("sql clause", "SQL"), ("b+ tree", "Indexing & B/B+ Trees")],
+            "Algorithms": [("merge sort", "Divide & Conquer, Sorting"), ("dijkstra", "Graph Algorithms (BFS, DFS, MST, SSSP)"), ("knapsack", "Greedy & Dynamic Programming")],
+            "Computer Networks": [("/26", "IP Addressing & Routing"), ("tcp", "Transport Layer: TCP/UDP"), ("routing", "IP Addressing & Routing")],
+            "Digital Logic": [("nand", "Boolean Algebra & K-maps"), ("decoder", "Combinational Circuits")],
+            "Theory of Computation": [("closed", "Context-Free Languages & PDA"), ("halting", "Turing Machines & Decidability")],
+            "Engineering Mathematics": [("complete graph", "Graph Theory & Combinatorics"), ("mutually exclusive", "Probability & Statistics")],
+            "Programming & Data Structures": [("bst", "Trees, BST, Heaps"), ("stack", "Arrays, Stacks, Queues, Linked Lists")],
+            "Computer Organization & Architecture": [("hazard", "Pipelining"), ("cache", "Cache & Memory Hierarchy")],
+        }
+        for name, questions in SEED_Q.items():
+            sid = find_one("subjects", {"name": name})["id"]
+            for question in questions:
+                text = question[0]
+                topic_id = next((topic_ids[name][topic] for needle, topic in rules.get(name, []) if needle in text.lower()), None)
+                add_doc("questions", dict(zip(("text", "a", "b", "c", "d", "ans", "expl"), question), subject_id=sid, topic_id=topic_id,
+                                               source="Original practice", year=None, kind="MCQ", important=0, bank_id=None, bank_set=None))
+    if count_docs("updates") == 0:
+        add_doc("updates", {"title": "Welcome to GATE CSE Prep", "body": "Admins can post exam notifications here. Always confirm dates on the official GATE website.", "link": "https://gate2026.iitg.ac.in", "created": datetime.now().isoformat()})
+    if count_docs("users", {"is_admin": 1}) == 0:
+        add_doc("users", {"name": "Admin", "email": app.config["ADMIN_EMAIL"], "pw": generate_password_hash(app.config["ADMIN_PASSWORD"]), "is_admin": 1, "hours": 4, "exam_date": app.config["GATE_EXAM_DATE"]})
 
 # ---------- Auth ----------
 def login_required(f):
@@ -254,7 +276,7 @@ def admin_required(f):
 
 @app.before_request
 def load_user():
-    g.user = q("SELECT * FROM users WHERE id=?", (session["uid"],), one=True) if "uid" in session else None
+    g.user = find_one("users", {"id": session["uid"]}) if "uid" in session else None
 
 @app.context_processor
 def inject():
@@ -267,17 +289,17 @@ def register():
         n, e, p = request.form["name"].strip(), request.form["email"].strip().lower(), request.form["password"]
         if not n or "@" not in e or len(p) < 6:
             flash("Enter a name, valid email and a password of 6+ characters.", "err")
-        elif q("SELECT 1 FROM users WHERE email=?", (e,), one=True):
+        elif find_one("users", {"email": e}):
             flash("Email already registered.", "err")
         else:
-            session["uid"] = run("INSERT INTO users(name,email,pw,exam_date) VALUES(?,?,?,?)", (n, e, generate_password_hash(p), app.config["GATE_EXAM_DATE"]))
+            session["uid"] = add_doc("users", {"name": n, "email": e, "pw": generate_password_hash(p), "exam_date": app.config["GATE_EXAM_DATE"], "is_admin": 0, "hours": 4})
             return redirect(url_for("dashboard"))
     return render_template("auth.html", mode="register")
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        u = q("SELECT * FROM users WHERE email=?", (request.form["email"].strip().lower(),), one=True)
+        u = find_one("users", {"email": request.form["email"].strip().lower()})
         if u and check_password_hash(u["pw"], request.form["password"]):
             session["uid"] = u["id"]
             nxt = request.args.get("next", "")
@@ -290,7 +312,7 @@ def admin_login():
     if g.user and g.user["is_admin"]:
         return redirect(url_for("admin"))
     if request.method == "POST":
-        u = q("SELECT * FROM users WHERE email=?", (request.form["email"].strip().lower(),), one=True)
+        u = find_one("users", {"email": request.form["email"].strip().lower()})
         if u and u["is_admin"] and check_password_hash(u["pw"], request.form["password"]):
             session["uid"] = u["id"]
             return redirect(url_for("admin"))
@@ -305,23 +327,29 @@ def logout():
 @app.route("/")
 def index():
     if g.user: return redirect(url_for("dashboard"))
-    return render_template("index.html", updates=q("SELECT * FROM updates ORDER BY id DESC LIMIT 3"))
+    return render_template("index.html", updates=find_many("updates", sort=[("id", -1)], limit=3))
 
 def subject_stats(uid):
-    return q("""SELECT s.*, COUNT(t.id) total, COUNT(p.topic_id) done FROM subjects s
-                LEFT JOIN topics t ON t.subject_id=s.id
-                LEFT JOIN progress p ON p.topic_id=t.id AND p.user_id=? GROUP BY s.id ORDER BY s.id""", (uid,))
+    result = []
+    for subject in find_many("subjects", sort=[("id", 1)]):
+        topics = find_many("topics", {"subject_id": subject["id"]})
+        completed = {p["topic_id"] for p in find_many("progress", {"user_id": uid})}
+        subject.update(total=len(topics), done=sum(t["id"] in completed for t in topics))
+        result.append(subject)
+    return result
 
 @app.route("/dashboard")
 @login_required
 def dashboard():
     subs = subject_stats(g.user["id"])
     total, done = sum(s["total"] for s in subs), sum(s["done"] for s in subs)
-    attempts = q("""SELECT a.*, s.name sname FROM attempts a LEFT JOIN subjects s ON s.id=a.subject_id
-                    WHERE user_id=? ORDER BY a.id DESC LIMIT 5""", (g.user["id"],))
+    attempts = find_many("attempts", {"user_id": g.user["id"]}, sort=[("id", -1)], limit=5)
+    for attempt in attempts:
+        subject = find_one("subjects", {"id": attempt.get("subject_id")}) if attempt.get("subject_id") else None
+        attempt["sname"] = subject["name"] if subject else None
     return render_template("dashboard.html", subs=subs, total=total, done=done, attempts=attempts,
-                           updates=q("SELECT * FROM updates ORDER BY id DESC LIMIT 3"),
-                           bookmarks=q("""SELECT r.* FROM bookmarks b JOIN resources r ON r.id=b.resource_id WHERE b.user_id=? LIMIT 5""", (g.user["id"],)))
+                           updates=find_many("updates", sort=[("id", -1)], limit=3),
+                           bookmarks=[r for b in find_many("bookmarks", {"user_id": g.user["id"]}, limit=5) if (r := find_one("resources", {"id": b["resource_id"]}))])
 
 @app.route("/subjects")
 @login_required
@@ -331,49 +359,63 @@ def subjects():
 @app.route("/subject/<int:sid>")
 @login_required
 def subject(sid):
-    s = q("SELECT * FROM subjects WHERE id=?", (sid,), one=True) or abort(404)
+    s = find_one("subjects", {"id": sid}) or abort(404)
     uid = g.user["id"]
-    topics = q("""SELECT t.*, (SELECT 1 FROM progress WHERE user_id=? AND topic_id=t.id) done,
-                  (SELECT body FROM notes WHERE user_id=? AND topic_id=t.id) note
-                  FROM topics t WHERE subject_id=?""", (uid, uid, sid))
-    res = {t["id"]: q("""SELECT r.*, (SELECT 1 FROM bookmarks WHERE user_id=? AND resource_id=r.id) bm
-                         FROM resources r WHERE topic_id=?""", (uid, t["id"])) for t in topics}
+    topics = find_many("topics", {"subject_id": sid}, sort=[("id", 1)])
+    progress_ids = {p["topic_id"] for p in find_many("progress", {"user_id": uid})}
+    for topic in topics:
+        topic["done"] = topic["id"] in progress_ids
+        note = find_one("notes", {"user_id": uid, "topic_id": topic["id"]})
+        topic["note"] = note.get("body") if note else None
+    bookmarked = {b["resource_id"] for b in find_many("bookmarks", {"user_id": uid})}
+    res = {}
+    for topic in topics:
+        res[topic["id"]] = find_many("resources", {"topic_id": topic["id"]})
+        for resource in res[topic["id"]]: resource["bm"] = resource["id"] in bookmarked
     return render_template("subject.html", s=s, topics=topics, res=res)
 
 @app.post("/topic/<int:tid>/toggle")
 @login_required
 def toggle(tid):
-    t = q("SELECT * FROM topics WHERE id=?", (tid,), one=True) or abort(404)
-    if q("SELECT 1 FROM progress WHERE user_id=? AND topic_id=?", (g.user["id"], tid), one=True):
-        run("DELETE FROM progress WHERE user_id=? AND topic_id=?", (g.user["id"], tid))
+    t = find_one("topics", {"id": tid}) or abort(404)
+    if find_one("progress", {"user_id": g.user["id"], "topic_id": tid}):
+        remove_doc("progress", {"user_id": g.user["id"], "topic_id": tid})
     else:
-        run("INSERT INTO progress VALUES(?,?,?)", (g.user["id"], tid, datetime.now().isoformat()))
+        put_doc("progress", {"user_id": g.user["id"], "topic_id": tid}, {"user_id": g.user["id"], "topic_id": tid, "done_at": datetime.now().isoformat()})
     return redirect(url_for("subject", sid=t["subject_id"]) + f"#t{tid}")
 
 @app.post("/topic/<int:tid>/note")
 @login_required
 def note(tid):
-    t = q("SELECT * FROM topics WHERE id=?", (tid,), one=True) or abort(404)
-    run("INSERT OR REPLACE INTO notes VALUES(?,?,?)", (g.user["id"], tid, request.form.get("body", "")[:2000]))
+    t = find_one("topics", {"id": tid}) or abort(404)
+    put_doc("notes", {"user_id": g.user["id"], "topic_id": tid}, {"user_id": g.user["id"], "topic_id": tid, "body": request.form.get("body", "")[:2000]})
     flash("Note saved.", "ok")
     return redirect(url_for("subject", sid=t["subject_id"]) + f"#t{tid}")
 
 @app.post("/resource/<int:rid>/bookmark")
 @login_required
 def bookmark(rid):
-    r = q("SELECT r.*, t.subject_id FROM resources r JOIN topics t ON t.id=r.topic_id WHERE r.id=?", (rid,), one=True) or abort(404)
-    if q("SELECT 1 FROM bookmarks WHERE user_id=? AND resource_id=?", (g.user["id"], rid), one=True):
-        run("DELETE FROM bookmarks WHERE user_id=? AND resource_id=?", (g.user["id"], rid))
+    r = find_one("resources", {"id": rid}) or abort(404)
+    topic = find_one("topics", {"id": r["topic_id"]}) or abort(404)
+    if find_one("bookmarks", {"user_id": g.user["id"], "resource_id": rid}):
+        remove_doc("bookmarks", {"user_id": g.user["id"], "resource_id": rid})
     else:
-        run("INSERT INTO bookmarks VALUES(?,?)", (g.user["id"], rid))
-    return redirect(url_for("subject", sid=r["subject_id"]))
+        put_doc("bookmarks", {"user_id": g.user["id"], "resource_id": rid}, {"user_id": g.user["id"], "resource_id": rid})
+    return redirect(url_for("subject", sid=topic["subject_id"]))
 
 @app.route("/search")
 @login_required
 def search():
     term = request.args.get("q", "").strip()
-    topics = q("SELECT t.*, s.name sname FROM topics t JOIN subjects s ON s.id=t.subject_id WHERE t.name LIKE ?", (f"%{term}%",)) if term else []
-    res = q("SELECT r.*, t.subject_id FROM resources r JOIN topics t ON t.id=r.topic_id WHERE r.title LIKE ?", (f"%{term}%",)) if term else []
+    pattern = re.compile(re.escape(term), re.I)
+    topics = find_many("topics") if term else []
+    topics = [dict(t, sname=(find_one("subjects", {"id": t["subject_id"]}) or {}).get("name", "")) for t in topics if pattern.search(t.get("name", ""))]
+    resources = find_many("resources") if term else []
+    res = []
+    for resource in resources:
+        if pattern.search(resource.get("title", "")):
+            topic = find_one("topics", {"id": resource["topic_id"]})
+            res.append(dict(resource, subject_id=topic["subject_id"] if topic else None))
     return render_template("search.html", term=term, topics=topics, res=res)
 
 # ---------- Study plan ----------
@@ -386,12 +428,17 @@ def plan():
             assert 0.5 <= h <= 16
         except Exception:
             flash("Enter a valid exam date and 0.5-16 hours/day.", "err"); return redirect(url_for("plan"))
-        run("UPDATE users SET exam_date=?, hours=? WHERE id=?", (ed.isoformat(), h, g.user["id"]))
+        collection("users").update_one({"id": g.user["id"]}, {"$set": {"exam_date": ed.isoformat(), "hours": h}})
         return redirect(url_for("plan"))
     ed = datetime.strptime(g.user["exam_date"] or app.config["GATE_EXAM_DATE"], "%Y-%m-%d").date()
     days = (ed - date.today()).days
-    rows = q("""SELECT t.id, t.name, s.name sname, s.weightage FROM topics t JOIN subjects s ON s.id=t.subject_id
-                WHERE t.id NOT IN (SELECT topic_id FROM progress WHERE user_id=?) ORDER BY s.weightage DESC, t.id""", (g.user["id"],))
+    completed = {p["topic_id"] for p in find_many("progress", {"user_id": g.user["id"]})}
+    rows = []
+    for topic in find_many("topics"):
+        if topic["id"] in completed: continue
+        subject = find_one("subjects", {"id": topic["subject_id"]})
+        if subject: rows.append(dict(topic, sname=subject["name"], weightage=subject["weightage"]))
+    rows.sort(key=lambda item: (-item["weightage"], item["id"]))
     hrs, per_topic = g.user["hours"], 4.0       # estimated study and practice effort per topic
     revision_days = max(0, min(30, days // 4))  # last 25% (max 30 days) reserved for revision & mocks
     study_days = max(0, days - revision_days)
@@ -417,16 +464,20 @@ def plan():
 
 # ---------- Mock tests ----------
 def choose_mock_questions(uid, subject_id=None, limit=30):
-    where_subject = ""
-    if subject_id is not None:
-        where_subject = " AND q.subject_id=?"
-    query = """SELECT q.*,t.name topic_name,b.name bank_name FROM questions q
-               LEFT JOIN topics t ON t.id=q.topic_id LEFT JOIN question_banks b ON b.id=q.bank_id
-               WHERE 1=1""" + where_subject + """ AND q.id NOT IN
-               (SELECT aa.question_id FROM attempt_answers aa JOIN attempts a ON a.id=aa.attempt_id WHERE a.user_id=?)
-               ORDER BY q.subject_id, COALESCE(b.created,'9999'), COALESCE(q.bank_set,999999), q.id"""
-    # Bind uid last because its placeholder follows the optional subject filter.
-    unseen = list(q(query, tuple(([subject_id] if subject_id is not None else []) + [uid])))
+    attempts = find_many("attempts", {"user_id": uid})
+    attempt_ids = {a["id"] for a in attempts}
+    used_answers = find_many("attempt_answers", {"attempt_id": {"$in": list(attempt_ids)}}) if attempt_ids else []
+    seen_ids = {a["question_id"] for a in used_answers}
+    topics = {t["id"]: t["name"] for t in find_many("topics")}
+    banks = {b["id"]: b for b in find_many("question_banks")}
+    pool = find_many("questions", {"subject_id": subject_id}) if subject_id is not None else find_many("questions")
+    for item in pool:
+        item["topic_name"] = topics.get(item.get("topic_id"))
+        bank = banks.get(item.get("bank_id"))
+        item["bank_name"] = bank.get("name") if bank else None
+        item["bank_created"] = bank.get("created", "9999") if bank else "9999"
+    pool.sort(key=lambda item: (item["subject_id"], item["bank_created"], item.get("bank_set") or 999999, item["id"]))
+    unseen = [item for item in pool if item["id"] not in seen_ids]
     def mixed_order(items):
         if subject_id is not None:
             return items
@@ -445,9 +496,7 @@ def choose_mock_questions(uid, subject_id=None, limit=30):
     else:
         selected = list(unseen)
         selected_ids = {r["id"] for r in selected}
-        seen_params = [subject_id] if subject_id is not None else []
-        seen = list(q("SELECT q.*,t.name topic_name,b.name bank_name FROM questions q LEFT JOIN topics t ON t.id=q.topic_id LEFT JOIN question_banks b ON b.id=q.bank_id WHERE q.id IN (SELECT aa.question_id FROM attempt_answers aa JOIN attempts a ON a.id=aa.attempt_id WHERE a.user_id=?)" + (" AND q.subject_id=?" if subject_id is not None else ""), tuple([uid] + seen_params)))
-        seen = [r for r in seen if r["id"] not in selected_ids]
+        seen = [r for r in pool if r["id"] in seen_ids and r["id"] not in selected_ids]
         if subject_id is not None:
             random.shuffle(seen)
         else:
@@ -462,15 +511,20 @@ def choose_mock_questions(uid, subject_id=None, limit=30):
 @app.route("/tests")
 @login_required
 def tests():
-    subs = q("SELECT s.*, (SELECT COUNT(*) FROM questions WHERE subject_id=s.id) nq FROM subjects s")
-    hist = q("SELECT a.*, s.name sname FROM attempts a LEFT JOIN subjects s ON s.id=a.subject_id WHERE user_id=? ORDER BY a.id DESC LIMIT 15", (g.user["id"],))
+    subs = find_many("subjects", sort=[("id", 1)])
+    for subject in subs: subject["nq"] = count_docs("questions", {"subject_id": subject["id"]})
+    hist = find_many("attempts", {"user_id": g.user["id"]}, sort=[("id", -1)], limit=15)
+    for attempt in hist:
+        subject = find_one("subjects", {"id": attempt.get("subject_id")}) if attempt.get("subject_id") else None
+        attempt["sname"] = subject["name"] if subject else None
     now = datetime.now()
     day_start = datetime.combine(now.date(), datetime.min.time()).isoformat()
-    used = q("SELECT COUNT(*) c FROM attempts WHERE user_id=? AND taken>=?", (g.user["id"], day_start), one=True)["c"]
-    last = q("SELECT taken FROM attempts WHERE user_id=? ORDER BY id DESC LIMIT 1", (g.user["id"],), one=True)
+    attempts = find_many("attempts", {"user_id": g.user["id"]}, sort=[("id", -1)])
+    used = sum(a["taken"] >= day_start for a in attempts)
+    last = attempts[0] if attempts else None
     ready_at = datetime.fromisoformat(last["taken"]) + timedelta(minutes=40) if last else now
     wait_seconds = max(0, int((ready_at - now).total_seconds())) if used < 5 else max(0, int((datetime.combine(now.date() + timedelta(days=1), datetime.min.time()) - now).total_seconds()))
-    return render_template("tests.html", subs=subs, hist=hist, total=q("SELECT COUNT(*) c FROM questions", one=True)["c"],
+    return render_template("tests.html", subs=subs, hist=hist, total=count_docs("questions"),
                            used=used, daily_limit=5, wait_seconds=wait_seconds, ready_at=ready_at)
 
 @app.route("/test/<sid>")
@@ -478,8 +532,9 @@ def tests():
 def take_test(sid):
     now = datetime.now()
     day_start = datetime.combine(now.date(), datetime.min.time()).isoformat()
-    used = q("SELECT COUNT(*) c FROM attempts WHERE user_id=? AND taken>=?", (g.user["id"], day_start), one=True)["c"]
-    last = q("SELECT taken FROM attempts WHERE user_id=? ORDER BY id DESC LIMIT 1", (g.user["id"],), one=True)
+    attempts = find_many("attempts", {"user_id": g.user["id"]}, sort=[("id", -1)])
+    used = sum(a["taken"] >= day_start for a in attempts)
+    last = attempts[0] if attempts else None
     if used >= 5:
         flash("You have reached today's five mock limit. Review your answers and come back tomorrow.", "err"); return redirect(url_for("tests"))
     if last and (now - datetime.fromisoformat(last["taken"])).total_seconds() < 2400:
@@ -487,7 +542,9 @@ def take_test(sid):
     if sid == "full":
         qs = choose_mock_questions(g.user["id"], limit=30); title = "CSE Mixed Mock"
     else:
-        s = q("SELECT * FROM subjects WHERE id=?", (sid,), one=True) or abort(404)
+        try: sid_int = int(sid)
+        except ValueError: abort(404)
+        s = find_one("subjects", {"id": sid_int}) or abort(404)
         qs = choose_mock_questions(g.user["id"], subject_id=s["id"], limit=30); title = s["name"]
     if not qs:
         flash("No questions yet for this subject.", "err"); return redirect(url_for("tests"))
@@ -506,7 +563,7 @@ def submit_test(sid):
     if not issued or ids != issued["ids"]:
         abort(400)
     active.pop(sid, None); session["active_tests"] = active
-    marks = {r["id"]: r for r in q("SELECT * FROM questions WHERE id IN (%s)" % ",".join("?" for _ in ids), ids)}
+    marks = {r["id"]: r for r in find_many("questions", {"id": {"$in": ids}})}
     c = w = 0; review = []
     for i in ids:
         qu = marks.get(i)
@@ -516,14 +573,14 @@ def submit_test(sid):
         a = request.form.get(f"q{i}")
         if a == qu["ans"]: c += 1
         elif a: w += 1
-        topic = q("SELECT name FROM topics WHERE id=?", (qu["topic_id"],), one=True) if qu["topic_id"] else None
+        topic = find_one("topics", {"id": qu["topic_id"]}) if qu.get("topic_id") else None
         review.append({"question": qu, "answer": a, "topic": topic["name"] if topic else "Uncategorized"})
     score = round(c - w / 3, 2)   # +1 correct, -1/3 wrong (GATE 1-mark MCQ style)
-    aid = run("INSERT INTO attempts(user_id,subject_id,score,total,correct,wrong,taken) VALUES(?,?,?,?,?,?,?)",
-              (g.user["id"], None if sid == "full" else int(sid), score, len(review), c, w, datetime.now().isoformat()))
+    aid = add_doc("attempts", {"user_id": g.user["id"], "subject_id": None if sid == "full" else int(sid), "score": score, "total": len(review),
+                                "correct": c, "wrong": w, "taken": datetime.now().isoformat()})
     for item in review:
         qu, answer = item["question"], item["answer"]
-        run("INSERT INTO attempt_answers(attempt_id,question_id,selected,is_correct) VALUES(?,?,?,?)", (aid, qu["id"], answer, int(answer == qu["ans"])))
+        add_doc("attempt_answers", {"attempt_id": aid, "question_id": qu["id"], "selected": answer, "is_correct": int(answer == qu["ans"])})
     topic_stats = {}
     for item in review:
         label = item["topic"]
@@ -532,10 +589,18 @@ def submit_test(sid):
         stat["correct"] += int(item["answer"] == item["question"]["ans"])
         stat["wrong"] += int(item["answer"] != item["question"]["ans"])
     weak = sorted((dict(name=k, **v, pct=round(v["correct"] * 100 / v["total"])) for k,v in topic_stats.items()), key=lambda x: x["pct"])
-    history = q("""SELECT COALESCE(t.name,'Uncategorized') name, COUNT(*) total, SUM(aa.is_correct) correct
-                   FROM attempt_answers aa JOIN attempts a ON a.id=aa.attempt_id JOIN questions q ON q.id=aa.question_id
-                   LEFT JOIN topics t ON t.id=q.topic_id WHERE a.user_id=? GROUP BY t.id ORDER BY t.name""", (g.user["id"],))
-    proficiency = [dict(name=r["name"], total=r["total"], correct=r["correct"], pct=round(r["correct"]*100/r["total"])) for r in history if r["name"] != "Uncategorized"]
+    user_attempts = find_many("attempts", {"user_id": g.user["id"]})
+    attempt_ids = [a["id"] for a in user_attempts]
+    answers = find_many("attempt_answers", {"attempt_id": {"$in": attempt_ids}}) if attempt_ids else []
+    question_map = {qu["id"]: qu for qu in find_many("questions", {"id": {"$in": [a["question_id"] for a in answers]}})} if answers else {}
+    topic_results = {}
+    for answer in answers:
+        qu = question_map.get(answer["question_id"])
+        topic = find_one("topics", {"id": qu.get("topic_id")}) if qu and qu.get("topic_id") else None
+        if not topic: continue
+        stat = topic_results.setdefault(topic["name"], {"total": 0, "correct": 0})
+        stat["total"] += 1; stat["correct"] += answer["is_correct"]
+    proficiency = [dict(name=name, total=stat["total"], correct=stat["correct"], pct=round(stat["correct"]*100/stat["total"])) for name,stat in topic_results.items()]
     proficiency.sort(key=lambda x: x["pct"])
     return render_template("result.html", review=review, score=score, c=c, w=w, n=len(review), topics=weak,
                            proficiency=proficiency, attempt_id=aid)
@@ -543,18 +608,33 @@ def submit_test(sid):
 @app.route("/revision")
 @login_required
 def revision():
-    rows = q("""SELECT q.*, t.name topic_name, s.name subject_name, aa.selected, a.taken
-                FROM attempt_answers aa JOIN attempts a ON a.id=aa.attempt_id JOIN questions q ON q.id=aa.question_id
-                LEFT JOIN topics t ON t.id=q.topic_id LEFT JOIN subjects s ON s.id=q.subject_id
-                WHERE a.user_id=? AND aa.is_correct=0 ORDER BY a.id DESC LIMIT 60""", (g.user["id"],))
-    rows = [dict(r) | {"miss_count": q("SELECT COUNT(*) c FROM attempt_answers aa JOIN attempts a ON a.id=aa.attempt_id WHERE a.user_id=? AND aa.question_id=? AND aa.is_correct=0", (g.user["id"], r["id"]), one=True)["c"]} for r in rows]
+    attempts = find_many("attempts", {"user_id": g.user["id"]})
+    attempt_ids = [a["id"] for a in attempts]
+    answers = find_many("attempt_answers", {"attempt_id": {"$in": attempt_ids}, "is_correct": 0}, sort=[("id", -1)], limit=60) if attempt_ids else []
+    misses = {}
+    rows = []
+    for answer in answers:
+        question = find_one("questions", {"id": answer["question_id"]})
+        if not question: continue
+        misses[question["id"]] = misses.get(question["id"], 0) + 1
+        topic = find_one("topics", {"id": question.get("topic_id")}) if question.get("topic_id") else None
+        subject = find_one("subjects", {"id": question["subject_id"]})
+        attempt = find_one("attempts", {"id": answer["attempt_id"]})
+        rows.append(dict(question, topic_name=topic["name"] if topic else None, subject_name=subject["name"] if subject else None,
+                         selected=answer.get("selected"), taken=attempt.get("taken", "") if attempt else "", miss_count=0))
+    for row in rows: row["miss_count"] = count_docs("attempt_answers", {"question_id": row["id"], "is_correct": 0, "attempt_id": {"$in": attempt_ids}})
     return render_template("revision.html", rows=rows)
 
 @app.route("/leaderboard")
 @login_required
 def leaderboard():
-    rows = q("""SELECT u.name, ROUND(SUM(a.score),2) pts, COUNT(a.id) tests FROM attempts a JOIN users u ON u.id=a.user_id
-                WHERE u.is_admin=0 GROUP BY u.id ORDER BY pts DESC LIMIT 20""")
+    stats = {}
+    for attempt in find_many("attempts"):
+        user = find_one("users", {"id": attempt["user_id"]})
+        if not user or user.get("is_admin"): continue
+        stat = stats.setdefault(user["id"], {"name": user["name"], "pts": 0, "tests": 0})
+        stat["pts"] += attempt["score"]; stat["tests"] += 1
+    rows = sorted([dict(v, pts=round(v["pts"], 2)) for v in stats.values()], key=lambda x: x["pts"], reverse=True)[:20]
     return render_template("leaderboard.html", rows=rows)
 
 # ---------- Live updates ----------
@@ -588,16 +668,18 @@ def fetch_feed():
 @app.route("/updates")
 @login_required
 def updates():
-    return render_template("updates.html", items=q("SELECT * FROM updates ORDER BY id DESC"), feed=fetch_feed(),
+    return render_template("updates.html", items=find_many("updates", sort=[("id", -1)]), feed=fetch_feed(),
                            exam=app.config["GATE_EXAM_DATE"])
 
 # ---------- Admin ----------
 @app.route("/admin")
 @admin_required
 def admin():
-    return render_template("admin.html", subs=q("SELECT * FROM subjects"), topics=q("SELECT t.*, s.name sname FROM topics t JOIN subjects s ON s.id=t.subject_id ORDER BY s.id"),
-                           updates=q("SELECT * FROM updates ORDER BY id DESC"), nu=q("SELECT COUNT(*) c FROM users", one=True)["c"],
-                           nq=q("SELECT COUNT(*) c FROM questions", one=True)["c"])
+    subs = find_many("subjects", sort=[("id", 1)])
+    topics = find_many("topics", sort=[("subject_id", 1), ("id", 1)])
+    for topic in topics: topic["sname"] = (find_one("subjects", {"id": topic["subject_id"]}) or {}).get("name", "")
+    return render_template("admin.html", subs=subs, topics=topics, updates=find_many("updates", sort=[("id", -1)]),
+                           nu=count_docs("users"), nq=count_docs("questions"))
 
 @app.post("/admin/<what>")
 @admin_required
@@ -605,26 +687,29 @@ def admin_add(what):
     f = request.form
     try:
         if what == "update":
-            run("INSERT INTO updates(title,body,link,created) VALUES(?,?,?,?)", (f["title"], f["body"], f["link"], datetime.now().isoformat()))
+            add_doc("updates", {"title": f["title"], "body": f["body"], "link": f["link"], "created": datetime.now().isoformat()})
         elif what == "topic":
-            run("INSERT INTO topics(subject_id,name) VALUES(?,?)", (f["subject_id"], f["name"]))
+            add_doc("topics", {"subject_id": int(f["subject_id"]), "name": f["name"].strip()})
         elif what == "resource":
             if not f["url"].startswith(("http://", "https://")): raise ValueError("URL must start with http(s)")
-            run("INSERT INTO resources(topic_id,title,url,kind) VALUES(?,?,?,?)", (f["topic_id"], f["title"], f["url"], f["kind"]))
+            add_doc("resources", {"topic_id": int(f["topic_id"]), "title": f["title"], "url": f["url"], "kind": f["kind"]})
         elif what == "question":
             if f["ans"] not in "ABCD": raise ValueError("bad answer")
+            subject_id = int(f["subject_id"])
             topic_id = f.get("topic_id") or None
             source_url = f.get("source", "Original practice").strip()[:300]
             if source_url and source_url.startswith(("http://", "https://")) is False and source_url != "Original practice":
                 raise ValueError("Source must be a URL or Original practice")
             if topic_id:
-                topic = q("SELECT subject_id FROM topics WHERE id=?", (topic_id,), one=True)
-                if not topic or str(topic["subject_id"]) != f["subject_id"]: raise ValueError("Topic must belong to the selected subject")
-            run("INSERT INTO questions(subject_id,topic_id,text,a,b,c,d,ans,expl,source,year,kind,important) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (f["subject_id"], topic_id, f["text"], f["a"], f["b"], f["c"], f["d"], f["ans"], f["expl"], source_url or "Original practice", f.get("year") or None, f.get("kind", "MCQ"), int(bool(f.get("important")))))
+                topic_id = int(topic_id)
+                topic = find_one("topics", {"id": topic_id})
+                if not topic or topic["subject_id"] != subject_id: raise ValueError("Topic must belong to the selected subject")
+            add_doc("questions", {"subject_id": subject_id, "topic_id": topic_id, "text": f["text"], "a": f["a"], "b": f["b"], "c": f["c"], "d": f["d"],
+                                   "ans": f["ans"], "expl": f["expl"], "source": source_url or "Original practice", "year": int(f["year"]) if f.get("year") else None,
+                                   "kind": f.get("kind", "MCQ"), "important": int(bool(f.get("important"))), "bank_id": None, "bank_set": None})
         else: abort(404)
         flash(f"{what.title()} added.", "ok")
-    except (KeyError, ValueError, sqlite3.Error) as e:
+    except (KeyError, ValueError) as e:
         flash(f"Could not add: {e}", "err")
     return redirect(url_for("admin"))
 
@@ -644,12 +729,12 @@ def import_questions():
             raise ValueError("CSV headers do not match the downloadable template")
         for line, row in enumerate(reader, start=2):
             row = {str(k).strip().lower(): (v or "").strip() for k, v in row.items() if k}
-            subject = q("SELECT id FROM subjects WHERE lower(name)=lower(?)", (row.get("subject", ""),), one=True)
+            subject = next((s for s in find_many("subjects") if s["name"].casefold() == row.get("subject", "").casefold()), None)
             if not subject or not row.get("question") or row.get("answer", "").upper() not in ("A", "B", "C", "D") or any(not row.get(k) for k in ("a", "b", "c", "d")):
                 skipped += 1; continue
             topic_id = None
             if row.get("topic"):
-                topic = q("SELECT id FROM topics WHERE subject_id=? AND lower(name)=lower(?)", (subject["id"], row["topic"]), one=True)
+                topic = next((t for t in find_many("topics", {"subject_id": subject["id"]}) if t["name"].casefold() == row["topic"].casefold()), None)
                 if not topic: skipped += 1; continue
                 topic_id = topic["id"]
             year = int(row["year"]) if row.get("year", "").isdigit() else None
@@ -660,11 +745,12 @@ def import_questions():
         for subject_id, items in grouped.items():
             random.shuffle(items)
             bank_id = uuid.uuid4().hex
-            run("INSERT INTO question_banks(id,subject_id,name,created,total) VALUES(?,?,?,?,?)", (bank_id, subject_id, os.path.basename(upload.filename), datetime.now().isoformat(), len(items)))
+            add_doc("question_banks", {"id": bank_id, "subject_id": subject_id, "name": os.path.basename(upload.filename), "created": datetime.now().isoformat(), "total": len(items)})
             for index, item in enumerate(items):
                 topic_id, *values = item
-                run("INSERT INTO questions(subject_id,topic_id,text,a,b,c,d,ans,expl,source,year,kind,important,bank_id,bank_set) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (subject_id, topic_id, *values[:9], "MCQ", values[9], bank_id, index // 30 + 1))
+                add_doc("questions", {"subject_id": subject_id, "topic_id": topic_id, "text": values[0], "a": values[1], "b": values[2], "c": values[3], "d": values[4],
+                                       "ans": values[5], "expl": values[6], "source": values[7], "year": values[8], "kind": "MCQ", "important": values[9],
+                                       "bank_id": bank_id, "bank_set": index // 30 + 1})
                 added += 1
         flash(f"Imported {added} questions into shuffled sets of up to 30. {skipped} rows were skipped (check subject/topic names, required fields, and answer labels).", "ok" if added else "err")
     except (UnicodeDecodeError, csv.Error, ValueError) as e:
@@ -682,12 +768,12 @@ def import_document():
         flash("Document is larger than 20 MB. Split it into smaller files and import each one.", "err"); return redirect(url_for("admin"))
     try:
         subject_id = int(request.form.get("subject_id", ""))
-        subject = q("SELECT id,name FROM subjects WHERE id=?", (subject_id,), one=True)
+        subject = find_one("subjects", {"id": subject_id})
         if not subject: raise ValueError("Choose a valid subject")
         topic_id = request.form.get("topic_id") or None
         if topic_id:
             topic_id = int(topic_id)
-            topic = q("SELECT id FROM topics WHERE id=? AND subject_id=?", (topic_id, subject_id), one=True)
+            topic = find_one("topics", {"id": topic_id, "subject_id": subject_id})
             if not topic: raise ValueError("The default topic must belong to the selected subject")
         text = read_question_document(upload.filename, data)
         parsed, issues = parse_question_document(text)
@@ -695,8 +781,8 @@ def import_document():
         if len(parsed) > 1000: raise ValueError("This document contains over 1,000 detected questions; split it into smaller documents")
         draft_id = uuid.uuid4().hex
         payload = json.dumps({"questions": parsed, "issues": issues, "year": request.form.get("year", "").strip()})
-        run("INSERT INTO import_drafts(id,user_id,subject_id,topic_id,filename,payload,created) VALUES(?,?,?,?,?,?,?)",
-            (draft_id, g.user["id"], subject_id, topic_id, os.path.basename(upload.filename), payload, datetime.now().isoformat()))
+        add_doc("import_drafts", {"id": draft_id, "user_id": g.user["id"], "subject_id": subject_id, "topic_id": topic_id,
+                                   "filename": os.path.basename(upload.filename), "payload": payload, "created": datetime.now().isoformat()})
         return redirect(url_for("preview_document", draft_id=draft_id))
     except Exception as e:
         flash(f"Could not read document: {e}", "err")
@@ -705,11 +791,12 @@ def import_document():
 @app.route("/admin/import-document/<draft_id>")
 @admin_required
 def preview_document(draft_id):
-    draft = q("SELECT d.*,s.name subject FROM import_drafts d JOIN subjects s ON s.id=d.subject_id WHERE d.id=? AND d.user_id=?",
-              (draft_id, g.user["id"]), one=True) or abort(404)
+    draft = find_one("import_drafts", {"id": draft_id, "user_id": g.user["id"]}) or abort(404)
+    subject = find_one("subjects", {"id": draft["subject_id"]})
+    draft["subject"] = subject["name"] if subject else "Unknown subject"
     payload = json.loads(draft["payload"])
-    default_topic = q("SELECT name FROM topics WHERE id=?", (draft["topic_id"],), one=True) if draft["topic_id"] else None
-    topics = q("SELECT name FROM topics WHERE subject_id=?", (draft["subject_id"],))
+    default_topic = find_one("topics", {"id": draft["topic_id"]}) if draft.get("topic_id") else None
+    topics = find_many("topics", {"subject_id": draft["subject_id"]})
     known = {t["name"].casefold() for t in topics}
     for item in payload["questions"]:
         item["resolved_topic"] = item["topic"] if item["topic"].casefold() in known else (default_topic["name"] if default_topic else "")
@@ -720,14 +807,14 @@ def preview_document(draft_id):
 @app.post("/admin/import-document/<draft_id>/cancel")
 @admin_required
 def cancel_document_import(draft_id):
-    run("DELETE FROM import_drafts WHERE id=? AND user_id=?", (draft_id, g.user["id"]))
+    remove_doc("import_drafts", {"id": draft_id, "user_id": g.user["id"]})
     flash("Document import cancelled; no questions were added.", "ok")
     return redirect(url_for("admin"))
 
 @app.post("/admin/import-document/<draft_id>/confirm")
 @admin_required
 def confirm_document_import(draft_id):
-    draft = q("SELECT * FROM import_drafts WHERE id=? AND user_id=?", (draft_id, g.user["id"]), one=True) or abort(404)
+    draft = find_one("import_drafts", {"id": draft_id, "user_id": g.user["id"]}) or abort(404)
     payload = json.loads(draft["payload"])
     items = payload["questions"]
     for index, item in enumerate(items):
@@ -744,16 +831,16 @@ def confirm_document_import(draft_id):
     bank_id = uuid.uuid4().hex
     bank_name = (request.form.get("name") or draft["filename"]).strip()[:120] or draft["filename"]
     created = datetime.now().isoformat()
-    run("INSERT INTO question_banks(id,subject_id,name,created,total) VALUES(?,?,?,?,?)",
-        (bank_id, draft["subject_id"], bank_name, created, len(items)))
-    topics = {t["name"].casefold(): t["id"] for t in q("SELECT id,name FROM topics WHERE subject_id=?", (draft["subject_id"],))}
+    add_doc("question_banks", {"id": bank_id, "subject_id": draft["subject_id"], "name": bank_name, "created": created, "total": len(items)})
+    topics = {t["name"].casefold(): t["id"] for t in find_many("topics", {"subject_id": draft["subject_id"]})}
     for index, item in enumerate(items):
         topic_id = topics.get(item["topic"].casefold()) if item["topic"] else draft["topic_id"]
         if item["topic"] and not topic_id:
             topic_id = draft["topic_id"]
-        run("INSERT INTO questions(subject_id,topic_id,text,a,b,c,d,ans,expl,source,year,kind,important,bank_id,bank_set) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (draft["subject_id"], topic_id, item["text"], item["a"], item["b"], item["c"], item["d"], item["ans"], item["expl"], f"Uploaded document: {draft['filename']}", int(payload["year"]) if payload["year"].isdigit() else None, "MCQ", 0, bank_id, index // 30 + 1))
-    run("DELETE FROM import_drafts WHERE id=?", (draft_id,))
+        add_doc("questions", {"subject_id": draft["subject_id"], "topic_id": topic_id, "text": item["text"], "a": item["a"], "b": item["b"], "c": item["c"], "d": item["d"],
+                               "ans": item["ans"], "expl": item["expl"], "source": f"Uploaded document: {draft['filename']}", "year": int(payload["year"]) if payload["year"].isdigit() else None,
+                               "kind": "MCQ", "important": 0, "bank_id": bank_id, "bank_set": index // 30 + 1})
+    remove_doc("import_drafts", {"id": draft_id})
     sets = (len(items) + 29) // 30
     flash(f"Imported {len(items)} questions into {sets} set(s) for {draft['subject_id']}. Questions were shuffled and divided into sets of up to 30.", "ok")
     return redirect(url_for("admin"))
@@ -761,8 +848,19 @@ def confirm_document_import(draft_id):
 @app.post("/admin/update/<int:uid>/delete")
 @admin_required
 def del_update(uid):
-    run("DELETE FROM updates WHERE id=?", (uid,)); return redirect(url_for("admin"))
+    remove_doc("updates", {"id": uid}); return redirect(url_for("admin"))
 
 init_db()
+
+@app.get("/health")
+def health():
+    try:
+        mongo_client.admin.command("ping")
+        counts = {name: count_docs(name) for name in ("users", "subjects", "topics", "questions", "attempts")}
+        return jsonify(status="ok", database=app.config["MONGO_DATABASE"], collections=counts), 200
+    except PyMongoError:
+        app.logger.exception("MongoDB health check failed")
+        return jsonify(status="error", message="MongoDB is unavailable"), 503
+
 if __name__ == "__main__":
     app.run(debug=True)
